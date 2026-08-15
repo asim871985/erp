@@ -27,24 +27,34 @@ jobs:
       - name: Start PostgreSQL and put psql on PATH
         shell: pwsh
         run: |
+          # Diagnostics first so a failure here is self-explanatory
+          Get-Service | Where-Object { $_.Name -like '*postgres*' } |
+            ForEach-Object { Write-Host "PG service candidate: $($_.Name) status=$($_.Status)" }
+          Get-ChildItem "$env:ProgramFiles\PostgreSQL" -Recurse -Filter psql.exe -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "psql.exe at: $($_.FullName)" }
+
           $service = Get-Service -Name 'postgresql*' | Sort-Object Name | Select-Object -First 1
           if ($null -eq $service) { throw 'PostgreSQL service not found after install' }
-          if ($service.Status -ne 'Running') { Start-Service -Name $service.Name }
-          $psql = Get-ChildItem "$env:ProgramFiles\PostgreSQL" -Recurse -Filter psql.exe |
+          if ($service.Status -ne 'Running') {
+            try { Start-Service -Name $service.Name } catch { throw "Could not start service $($service.Name): $_" }
+            Start-Sleep -Seconds 3
+          }
+
+          $psql = Get-ChildItem "$env:ProgramFiles\PostgreSQL" -Recurse -Filter psql.exe -ErrorAction SilentlyContinue |
                   Where-Object { $_.FullName -like '*\bin\psql.exe' } | Select-Object -First 1
           if ($null -eq $psql) { throw 'psql.exe not found after install' }
           $psql.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+          # Wait until PostgreSQL answers, and FAIL LOUDLY if it never does
+          # (previously this loop silently succeeded after 30 tries).
           $env:PGPASSWORD = 'postgres'
+          $ready = $false
           for ($i = 0; $i -lt 30; $i++) {
-            try {
-              & $psql.FullName -h localhost -U postgres -tAc 'SELECT 1' | Out-Null
-              Write-Host 'PostgreSQL is ready.'
-              break
-            } catch {
-              Start-Sleep -Seconds 2
-            }
+            & $psql.FullName -h localhost -U postgres -tAc 'SELECT 1' 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { $ready = $true; Write-Host 'PostgreSQL is ready.'; break }
+            Start-Sleep -Seconds 2
           }
+          if (-not $ready) { throw 'PostgreSQL never became ready for SELECT 1' }
 
       # The committed appsettings.json holds the developer's local password;
       # CI overrides the connection string to point at the freshly installed
