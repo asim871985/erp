@@ -542,8 +542,11 @@ points the static `AppConfig.ConnectionString` at its own scratch database.
 needs a real PostgreSQL. The job:
 
 1. checks out and installs the .NET 8 SDK;
-2. installs **PostgreSQL 17 via chocolatey** (password `postgres`), starts the
-   service, puts `psql` on PATH, and waits until it answers `SELECT 1`;
+2. sets up **PostgreSQL 17** via the maintained `ikalnytskyi/action-setup-postgres`
+   action (user-owned cluster, `psql` on PATH). A chocolatey install was
+   verified to work on the runner, but the choco-registered Windows service
+   can't start reliably on newer runner images (data-dir ACL problem,
+   actions/runner-images#13040), so the action is used instead;
 3. **rewrites `ErpApp/appsettings.json`** to point at the CI database (the
    committed file holds the developer's local password — CI never uses it);
 4. runs `dotnet test`, which executes the unit suite (18 tests) and the
