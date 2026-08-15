@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # WinForms is Windows-only and the integration tests need a real
+      # PostgreSQL, so install one via chocolatey on the Windows runner.
+      - name: Install PostgreSQL
+        shell: pwsh
+        run: |
+          choco install postgresql17 --params '/Password:postgres' -y --no-progress
+
+      - name: Start PostgreSQL and put psql on PATH
+        shell: pwsh
+        run: |
+          $service = Get-Service -Name 'postgresql*' | Sort-Object Name | Select-Object -First 1
+          if ($null -eq $service) { throw 'PostgreSQL service not found after install' }
+          if ($service.Status -ne 'Running') { Start-Service -Name $service.Name }
+          $psql = Get-ChildItem "$env:ProgramFiles\PostgreSQL" -Recurse -Filter psql.exe |
+                  Where-Object { $_.FullName -like '*\bin\psql.exe' } | Select-Object -First 1
+          if ($null -eq $psql) { throw 'psql.exe not found after install' }
+          $psql.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          $env:PGPASSWORD = 'postgres'
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              & $psql.FullName -h localhost -U postgres -tAc 'SELECT 1' | Out-Null
+              Write-Host 'PostgreSQL is ready.'
+              break
+            } catch {
+              Start-Sleep -Seconds 2
+            }
+          }
+
+      # The committed appsettings.json holds the developer's local password;
+      # CI overrides the connection string to point at the freshly installed
+      # PostgreSQL instead.
+      - name: Point appsettings at the CI database
+        shell: pwsh
+        run: |
+          $json = Get-Content -Path 'ErpApp/appsettings.json' -Raw | ConvertFrom-Json
+          $json.ConnectionStrings.ErpDb = 'Host=localhost;Port=5432;Database=postgres;Username=postgres;Password=postgres'
+          ($json | ConvertTo-Json -Depth 5) | Set-Content -Path 'ErpApp/appsettings.json' -Encoding utf8
+
+      # Runs both test projects (ErpApp.Tests + ErpApp.IntegrationTests). The
+      # integration suite creates and drops its own scratch databases.
+      - name: Run all tests
+        run: dotnet test --nologo
