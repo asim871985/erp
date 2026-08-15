@@ -24,37 +24,40 @@ jobs:
         run: |
           choco install postgresql17 --params '/Password:postgres' -y --no-progress
 
+      # The choco-installed Windows service frequently can't start on newer
+      # runner images (data-dir ACL problem, actions/runner-images#13040), so
+      # don't rely on it — spin up a fresh cluster in the user-writable temp
+      # dir with trust auth instead. The runner user owns that data dir, which
+      # sidesteps the permission issue entirely.
       - name: Start PostgreSQL and put psql on PATH
         shell: pwsh
         run: |
-          # Diagnostics first so a failure here is self-explanatory
-          Get-Service | Where-Object { $_.Name -like '*postgres*' } |
-            ForEach-Object { Write-Host "PG service candidate: $($_.Name) status=$($_.Status)" }
-          Get-ChildItem "$env:ProgramFiles\PostgreSQL" -Recurse -Filter psql.exe -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host "psql.exe at: $($_.FullName)" }
+          $pgBin = Get-ChildItem "$env:ProgramFiles\PostgreSQL" -Recurse -Filter psql.exe -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -like '*\bin\psql.exe' } | Select-Object -First 1
+          if ($null -eq $pgBin) { throw 'psql.exe not found after install' }
+          $binDir = $pgBin.DirectoryName
+          Write-Host "PostgreSQL bin: $binDir"
+          $binDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-          $service = Get-Service -Name 'postgresql*' | Sort-Object Name | Select-Object -First 1
-          if ($null -eq $service) { throw 'PostgreSQL service not found after install' }
-          if ($service.Status -ne 'Running') {
-            try { Start-Service -Name $service.Name } catch { throw "Could not start service $($service.Name): $_" }
-            Start-Sleep -Seconds 3
+          # Stop the choco service if it happens to be running so our cluster
+          # can bind port 5432 without a conflict.
+          Get-Service -Name 'postgresql*' -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.Status -eq 'Running') { Stop-Service -Name $_.Name -Force; Write-Host "Stopped $($_.Name)" }
           }
 
-          $psql = Get-ChildItem "$env:ProgramFiles\PostgreSQL" -Recurse -Filter psql.exe -ErrorAction SilentlyContinue |
-                  Where-Object { $_.FullName -like '*\bin\psql.exe' } | Select-Object -First 1
-          if ($null -eq $psql) { throw 'psql.exe not found after install' }
-          $psql.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-          # Wait until PostgreSQL answers, and FAIL LOUDLY if it never does
-          # (previously this loop silently succeeded after 30 tries).
-          $env:PGPASSWORD = 'postgres'
-          $ready = $false
-          for ($i = 0; $i -lt 30; $i++) {
-            & $psql.FullName -h localhost -U postgres -tAc 'SELECT 1' 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) { $ready = $true; Write-Host 'PostgreSQL is ready.'; break }
-            Start-Sleep -Seconds 2
+          $data = Join-Path $env:RUNNER_TEMP 'pgdata'
+          if (-not (Test-Path (Join-Path $data 'PG_VERSION'))) {
+            & "$binDir\initdb.exe" -D $data -U postgres --auth=trust -E UTF8
+            if ($LASTEXITCODE -ne 0) { throw 'initdb failed' }
           }
-          if (-not $ready) { throw 'PostgreSQL never became ready for SELECT 1' }
+          & "$binDir\pg_ctl.exe" -D $data -l (Join-Path $env:RUNNER_TEMP 'pg.log') -o '-p 5432' start
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content (Join-Path $env:RUNNER_TEMP 'pg.log') -ErrorAction SilentlyContinue
+            throw 'pg_ctl could not start the cluster'
+          }
+
+          $env:PGPASSWORD = 'postgres' # trust auth, so this is never actually checked
+          & psql -h localhost -U postgres -tAc 'SELECT 1'
 
       # The committed appsettings.json holds the developer's local password;
       # CI overrides the connection string to point at the freshly installed
